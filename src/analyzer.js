@@ -4,6 +4,8 @@
  * - Stage 2: Vision analysis (OCR + extraction) using Meta Llama 3.2 11B Vision
  */
 
+import { fetchWithTimeout, parseBoolean } from "./utils.js";
+
 const TEXT_MODELS = [
   "@cf/meta/llama-3.1-8b-instruct-fast",
   "@cf/meta/llama-3.1-8b-instruct",
@@ -60,7 +62,9 @@ Analyze the tweet text and return ONLY a raw JSON object (no markdown, no backti
       const outputText = typeof response === "object" ? (response.response || JSON.stringify(response)) : String(response);
       const parsed = cleanAndParseJson(outputText);
 
-      if (parsed && typeof parsed.is_advisory === "boolean") {
+      if (parsed && parsed.is_advisory !== undefined) {
+        parsed.is_advisory = parseBoolean(parsed.is_advisory);
+        parsed.confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0.7;
         return parsed;
       }
 
@@ -70,7 +74,7 @@ Analyze the tweet text and return ONLY a raw JSON object (no markdown, no backti
     }
   }
 
-  console.warn("All AI text models failed or returned non-JSON. Using keyword fallback analysis.");
+  console.warn("All AI text models failed. Using fallback text analysis.");
   return fallbackTextAnalysis(tweetText);
 }
 
@@ -81,14 +85,15 @@ export async function analyzeNoticeImage(env, imageUrl) {
   console.log(`Fetching image for vision analysis: ${imageUrl}`);
 
   try {
-    const imgResponse = await fetch(imageUrl);
+    const imgResponse = await fetchWithTimeout(imageUrl, {}, 10000);
     if (!imgResponse.ok) {
       console.error(`Failed to fetch image: HTTP ${imgResponse.status}`);
       return null;
     }
 
     const imageBuffer = await imgResponse.arrayBuffer();
-    const imageBytes = [...new Uint8Array(imageBuffer)];
+    // Pass Uint8Array directly to avoid memory-heavy JS array expansion
+    const uint8Array = new Uint8Array(imageBuffer);
 
     const prompt = `This is an official public notice poster from Delhi Jal Board.
 Please extract all structured text and details from this image.
@@ -109,13 +114,15 @@ Return ONLY a raw JSON object (no markdown, no backticks) with this exact schema
         console.log(`Running vision analysis with model: ${model}`);
         const response = await env.AI.run(model, {
           prompt: prompt,
-          image: imageBytes
+          image: uint8Array
         });
 
         const outputText = typeof response === "object" ? (response.response || JSON.stringify(response)) : String(response);
         const parsed = cleanAndParseJson(outputText);
 
         if (parsed) {
+          // Strictly type-check boolean value (prevents "false" string evaluating to true)
+          parsed.is_advisory = parseBoolean(parsed.is_advisory);
           return parsed;
         }
       } catch (err) {
@@ -158,10 +165,21 @@ function cleanAndParseJson(text) {
  */
 function fallbackTextAnalysis(text) {
   const lower = text.toLowerCase();
-  const advisoryKeywords = ["maintenance", "water supply", "affected", "disruption", "shutdown", "low pressure", "important_notice", "alert"];
+  const advisoryKeywords = [
+    "maintenance",
+    "water supply",
+    "affected",
+    "disruption",
+    "shutdown",
+    "low pressure",
+    "important notice",
+    "important_notice",
+    "alert",
+    "notice"
+  ];
   const matches = advisoryKeywords.filter(kw => lower.includes(kw));
 
-  const isAdvisory = matches.length >= 2 || lower.includes("important_notice");
+  const isAdvisory = matches.length >= 2 || lower.includes("important notice") || lower.includes("important_notice");
 
   return {
     is_advisory: isAdvisory,
