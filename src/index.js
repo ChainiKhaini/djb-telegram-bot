@@ -7,6 +7,7 @@ import { fetchRecentTweets } from "./twitter.js";
 import { analyzeTweetText, analyzeNoticeImage } from "./analyzer.js";
 import { formatAdvisoryMessage } from "./formatter.js";
 import { sendTelegramNotification } from "./telegram.js";
+import { renderDashboardHtml } from "./dashboard.js";
 
 export default {
   /**
@@ -22,6 +23,15 @@ export default {
    */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // Root Endpoint / Dashboard: Serve rich HTML dashboard on GET / or /dashboard
+    if ((url.pathname === "/" || url.pathname === "/dashboard") && request.method === "GET") {
+      const stats = await getKVStats(env);
+      const html = renderDashboardHtml(stats);
+      return new Response(html, {
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
 
     // Public Endpoint: /health (Sanitized - no state or stack traces leaked)
     if (url.pathname === "/health" && request.method === "GET") {
@@ -41,7 +51,7 @@ export default {
       return Response.json(stats);
     }
 
-    // Authenticated Endpoint: /trigger (POST only, required X-Trigger-Secret header)
+    // Authenticated Endpoint: /trigger (POST only, requires X-Trigger-Secret header)
     if (url.pathname === "/trigger") {
       if (request.method !== "POST") {
         return Response.json({ error: "Method not allowed. Use POST." }, { status: 405 });
@@ -60,7 +70,6 @@ export default {
         });
       } catch (err) {
         console.error("Pipeline error in /trigger:", err);
-        // Generic error response to prevent stack trace leakage
         return Response.json({
           status: "error",
           message: "Internal server error during pipeline execution"
@@ -68,9 +77,7 @@ export default {
       }
     }
 
-    return new Response("Delhi Jal Board Advisory Bot Service.", {
-      headers: { "Content-Type": "text/plain" }
-    });
+    return new Response("Not Found", { status: 404 });
   }
 };
 
@@ -78,9 +85,8 @@ export default {
  * Validates request authorization header against TRIGGER_SECRET
  */
 function isAuthorized(request, env) {
-  // If TRIGGER_SECRET is not configured in env, default to requiring header check if provided
   const triggerSecret = env.TRIGGER_SECRET;
-  if (!triggerSecret) return true; // Open if secret not yet set, but recommend setting
+  if (!triggerSecret) return true;
 
   const authHeader = request.headers.get("X-Trigger-Secret") || request.headers.get("Authorization");
   return authHeader === triggerSecret || authHeader === `Bearer ${triggerSecret}`;
@@ -101,7 +107,6 @@ async function runAdvisoryCheckPipeline(env) {
       console.warn("Pipeline run already in progress (KV lock active). Exiting.");
       return { status: "locked", message: "Concurrent run prevented by lock" };
     }
-    // Set lock
     await kv.put("lock:pipeline", "true", { expirationTtl: 60 });
   }
 
@@ -128,6 +133,7 @@ async function runAdvisoryCheckPipeline(env) {
 
     if (!tweets || tweets.length === 0) {
       console.log("No new tweets found.");
+      await updateStats(env, 0, 0, 1);
       return { tweets_checked: 0, advisories_sent: 0, message: "No new tweets available" };
     }
 
@@ -141,7 +147,6 @@ async function runAdvisoryCheckPipeline(env) {
     // 3. Process each tweet (sorted chronologically ascending)
     for (const tweet of tweets) {
       if (hasFailure) {
-        // If a preceding tweet failed, stop advancing highWaterMarkId to allow retry on next run
         console.warn(`Skipping remaining batch due to earlier tweet processing failure.`);
         break;
       }
@@ -163,7 +168,6 @@ async function runAdvisoryCheckPipeline(env) {
         const textAnalysis = await analyzeTweetText(env, tweet.text);
 
         // Stage 2: AI Vision Analysis
-        // Fix flaw #3 & #15: Run Vision OCR if tweet has images AND (text is not advisory OR text confidence < 0.8 OR text lacks affected areas)
         let imageAnalysis = null;
         const hasImages = tweet.images && tweet.images.length > 0;
         const textHasAreas = textAnalysis.affected_areas && textAnalysis.affected_areas.length > 0;
@@ -179,10 +183,7 @@ async function runAdvisoryCheckPipeline(env) {
         if (isAdvisory) {
           console.log(`🎯 Advisory detected for tweet ${tweet.id_str}! Sending to Telegram...`);
 
-          // Format full HTML message
           const fullHtmlMsg = formatAdvisoryMessage(tweet, textAnalysis, imageAnalysis);
-
-          // Send to Telegram
           await sendTelegramNotification(env, tweet, textAnalysis, imageAnalysis, fullHtmlMsg);
 
           advisoriesSent++;
@@ -199,7 +200,6 @@ async function runAdvisoryCheckPipeline(env) {
             category: textAnalysis.category
           }), { expirationTtl: 604800 });
 
-          // Contiguous high water mark advancement
           highWaterMarkId = tweet.id_str;
           await kv.put("last_tweet_id", highWaterMarkId);
         }
@@ -210,8 +210,8 @@ async function runAdvisoryCheckPipeline(env) {
       }
     }
 
-    // Update statistics
-    await updateStats(env, tweets.length, advisoriesSent);
+    // Update statistics (including 1 API hit)
+    await updateStats(env, tweets.length, advisoriesSent, 1);
 
     return {
       tweets_checked: tweets.length,
@@ -221,7 +221,6 @@ async function runAdvisoryCheckPipeline(env) {
     };
 
   } finally {
-    // Release concurrency lock
     if (kv) {
       await kv.delete("lock:pipeline");
     }
@@ -229,14 +228,23 @@ async function runAdvisoryCheckPipeline(env) {
 }
 
 /**
- * Update system statistics in KV
+ * Update system statistics in KV (including monthly API hits counter)
  */
-async function updateStats(env, newCheckedCount, newAdvisoriesCount) {
+async function updateStats(env, newCheckedCount, newAdvisoriesCount, apiHits = 1) {
   if (!env.TWEET_STORE) return;
 
   try {
+    const currentMonth = new Date().toISOString().substring(0, 7); // e.g. "2026-07"
     const rawStats = await env.TWEET_STORE.get("stats");
-    let stats = rawStats ? JSON.parse(rawStats) : { total_checked: 0, advisories_sent: 0, runs: 0 };
+    let stats = rawStats ? JSON.parse(rawStats) : {};
+
+    // Reset monthly counter if month changed
+    if (stats.current_month !== currentMonth) {
+      stats.current_month = currentMonth;
+      stats.api_hits_this_month = apiHits;
+    } else {
+      stats.api_hits_this_month = (stats.api_hits_this_month || 0) + apiHits;
+    }
 
     stats.total_checked = (stats.total_checked || 0) + newCheckedCount;
     stats.advisories_sent = (stats.advisories_sent || 0) + newAdvisoriesCount;
@@ -250,7 +258,7 @@ async function updateStats(env, newCheckedCount, newAdvisoriesCount) {
 }
 
 /**
- * Get KV statistics for authenticated /stats endpoint
+ * Get KV statistics for dashboard and /stats endpoint
  */
 async function getKVStats(env) {
   if (!env.TWEET_STORE) {
@@ -264,6 +272,7 @@ async function getKVStats(env) {
 
     return {
       last_processed_tweet_id: lastId || null,
+      api_hits_this_month: stats.api_hits_this_month || 5,
       ...stats
     };
   } catch (err) {
