@@ -1,0 +1,15 @@
+# Local environment secrets
+.dev.vars
+*.env
+
+# Dependencies
+node_modules/
+
+# Cloudflare Wrangler cache
+.wrangler/
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
